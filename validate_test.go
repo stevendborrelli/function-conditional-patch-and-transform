@@ -9,7 +9,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/utils/ptr"
 
-	"github.com/stevendborrelli/function-conditional-patch-and-transform/input/v1beta1"
+	"github.com/upboundcare/function-conditional-patch-and-transform/input/v1beta1"
 )
 
 func TestValidateReadinessCheck(t *testing.T) {
@@ -375,6 +375,131 @@ func TestValidatePatch(t *testing.T) {
 			err := ValidatePatch(&tc.args.patch)
 			if diff := cmp.Diff(tc.want.err, err, cmpopts.IgnoreFields(field.Error{}, "Detail", "BadValue")); diff != "" {
 				t.Errorf("%s\nValidatePatch(...): -want, +got:\n%s", tc.reason, diff)
+			}
+		})
+	}
+}
+
+func TestValidateCombine(t *testing.T) {
+	type args struct {
+		combine v1beta1.Combine
+	}
+	type want struct {
+		err *field.Error
+	}
+
+	cases := map[string]struct {
+		reason string
+		args   args
+		want   want
+	}{
+		"MissingStrategy": {
+			reason: "A combine with no strategy is invalid",
+			args: args{
+				combine: v1beta1.Combine{},
+			},
+			want: want{
+				err: &field.Error{
+					Type:  field.ErrorTypeRequired,
+					Field: "strategy",
+				},
+			},
+		},
+		"InvalidStrategy": {
+			reason: "A combine with an unknown strategy is invalid",
+			args: args{
+				combine: v1beta1.Combine{
+					Strategy: "Smoosh",
+				},
+			},
+			want: want{
+				err: &field.Error{
+					Type:  field.ErrorTypeInvalid,
+					Field: "strategy",
+				},
+			},
+		},
+		"ValidStringCombine": {
+			reason: "A string combine with variables and a format string should be valid",
+			args: args{
+				combine: v1beta1.Combine{
+					Strategy: v1beta1.CombineStrategyString,
+					Variables: []v1beta1.CombineVariable{
+						{FromFieldPath: "a"},
+						{FromFieldPath: "b"},
+					},
+					String: &v1beta1.StringCombine{
+						Format: "%s-%s",
+					},
+				},
+			},
+			want: want{
+				err: nil,
+			},
+		},
+		"MissingVariables": {
+			reason: "A combine with no variables is invalid",
+			args: args{
+				combine: v1beta1.Combine{
+					Strategy: v1beta1.CombineStrategyString,
+					String: &v1beta1.StringCombine{
+						Format: "%s-%s",
+					},
+				},
+			},
+			want: want{
+				err: &field.Error{
+					Type:  field.ErrorTypeRequired,
+					Field: "variables",
+				},
+			},
+		},
+		"VariableMissingFromFieldPath": {
+			reason: "A variable with no fromFieldPath is invalid",
+			args: args{
+				combine: v1beta1.Combine{
+					Strategy: v1beta1.CombineStrategyString,
+					Variables: []v1beta1.CombineVariable{
+						{FromFieldPath: "a"},
+						{FromFieldPath: ""}, // Missing.
+					},
+					String: &v1beta1.StringCombine{
+						Format: "%s-%s",
+					},
+				},
+			},
+			want: want{
+				err: &field.Error{
+					Type:  field.ErrorTypeRequired,
+					Field: "variables[1].fromFieldPath",
+				},
+			},
+		},
+		"MissingStringConfig": {
+			reason: "A string combine with no string config is invalid",
+			args: args{
+				combine: v1beta1.Combine{
+					Strategy: v1beta1.CombineStrategyString,
+					Variables: []v1beta1.CombineVariable{
+						{FromFieldPath: "a"},
+						{FromFieldPath: "b"},
+					},
+				},
+			},
+			want: want{
+				err: &field.Error{
+					Type:  field.ErrorTypeRequired,
+					Field: "string",
+				},
+			},
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			err := ValidateCombine(&tc.args.combine)
+			if diff := cmp.Diff(tc.want.err, err, cmpopts.IgnoreFields(field.Error{}, "Detail", "BadValue")); diff != "" {
+				t.Errorf("%s\nValidateCombine(...): -want, +got:\n%s", tc.reason, diff)
 			}
 		})
 	}

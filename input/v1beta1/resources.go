@@ -20,7 +20,7 @@ type Resources struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	// If defines a CEL condition whether this function will render
+	// Condition defines a CEL condition whether this function will render
 	Condition Condition `json:"condition,omitempty"`
 
 	// PatchSets define a named set of patches that may be included by any

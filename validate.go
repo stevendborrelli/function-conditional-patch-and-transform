@@ -6,7 +6,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/util/validation/field"
 
-	"github.com/stevendborrelli/function-conditional-patch-and-transform/input/v1beta1"
+	"github.com/upboundcare/function-conditional-patch-and-transform/input/v1beta1"
 )
 
 // WrapFieldError wraps the given field.Error adding the given field.Path as root of the Field.
@@ -98,13 +98,14 @@ func ValidateEnvironment(e *v1beta1.Environment) *field.Error {
 	}
 	for i, p := range e.Patches {
 		p := p
-		switch p.GetType() { //nolint:exhaustive // Intentionally targeting only environment patches.
-		case v1beta1.PatchTypeCombineToEnvironment,
-			v1beta1.PatchTypeCombineFromEnvironment,
-			v1beta1.PatchTypeFromEnvironmentFieldPath,
-			v1beta1.PatchTypeToEnvironmentFieldPath:
+		switch p.GetType() { //nolint:exhaustive // Only target valid patches according the API spec
+		case
+			v1beta1.PatchTypeFromCompositeFieldPath,
+			v1beta1.PatchTypeToCompositeFieldPath,
+			v1beta1.PatchTypeCombineFromComposite,
+			v1beta1.PatchTypeCombineToComposite:
 		default:
-			return field.Invalid(field.NewPath("patches").Index(i).Key("type"), p.Type, "invalid environment patch type")
+			return field.Invalid(field.NewPath("patches").Index(i).Key("type"), p.GetType(), "invalid environment patch type")
 		}
 
 		if err := ValidatePatch(&p); err != nil {
@@ -188,6 +189,7 @@ func ValidatePatch(p PatchInterface) *field.Error { //nolint: gocyclo // This is
 		if p.GetToFieldPath() == "" {
 			return field.Required(field.NewPath("toFieldPath"), fmt.Sprintf("toFieldPath must be set for patch type %s", p.GetType()))
 		}
+		return WrapFieldError(ValidateCombine(p.GetCombine()), field.NewPath("combine"))
 	default:
 		// Should never happen
 		return field.Invalid(field.NewPath("type"), p.GetType(), "unknown patch type")
@@ -195,6 +197,48 @@ func ValidatePatch(p PatchInterface) *field.Error { //nolint: gocyclo // This is
 	for i, t := range p.GetTransforms() {
 		if err := ValidateTransform(t); err != nil {
 			return WrapFieldError(err, field.NewPath("transforms").Index(i))
+		}
+	}
+	if pp := p.GetPolicy(); pp != nil {
+		switch pp.GetToFieldPathPolicy() {
+		case v1beta1.ToFieldPathPolicyReplace,
+			v1beta1.ToFieldPathPolicyAppendArray,
+			v1beta1.ToFieldPathPolicyMergeObject:
+			// ok
+		default:
+			return field.Invalid(field.NewPath("policy", "toFieldPathPolicy"), pp.GetToFieldPathPolicy(), "unknown toFieldPathPolicy")
+		}
+		switch pp.GetFromFieldPathPolicy() {
+		case v1beta1.FromFieldPathPolicyRequired,
+			v1beta1.FromFieldPathPolicyOptional:
+			// ok
+		default:
+			return field.Invalid(field.NewPath("policy", "fromFieldPathPolicy"), pp.GetFromFieldPathPolicy(), "unknown fromFieldPathPolicy")
+		}
+	}
+	return nil
+}
+
+// ValidateCombine validates a Combine.
+func ValidateCombine(c *v1beta1.Combine) *field.Error {
+	switch c.Strategy {
+	case v1beta1.CombineStrategyString:
+		if c.String == nil {
+			return field.Required(field.NewPath("string"), fmt.Sprintf("string must be set for combine strategy %s", c.Strategy))
+		}
+	case "":
+		return field.Required(field.NewPath("strategy"), "a combine strategy must be provided")
+	default:
+		return field.Invalid(field.NewPath("strategy"), c.Strategy, "unknown strategy type")
+	}
+
+	if len(c.Variables) == 0 {
+		return field.Required(field.NewPath("variables"), "at least one variable must be provided")
+	}
+
+	for i := range c.Variables {
+		if c.Variables[i].FromFieldPath == "" {
+			return field.Required(field.NewPath("variables").Index(i).Child("fromFieldPath"), "fromFieldPath must be set for each combine variable")
 		}
 	}
 

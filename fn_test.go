@@ -22,7 +22,7 @@ import (
 	"github.com/crossplane/function-sdk-go/resource"
 	"github.com/crossplane/function-sdk-go/response"
 
-	"github.com/stevendborrelli/function-conditional-patch-and-transform/input/v1beta1"
+	"github.com/upboundcare/function-conditional-patch-and-transform/input/v1beta1"
 )
 
 func TestRunFunction(t *testing.T) {
@@ -384,17 +384,182 @@ func TestRunFunction(t *testing.T) {
 				},
 			},
 		},
-		"FailedPatchNotSaved": {
-			reason: "If we fail to patch a desired resource produced by a previous Function in the pipeline we should return a warning result, and leave the original desired resource untouched.",
+		"OptionalFieldPathNotFound": {
+			reason: "If we fail to patch a desired resource because an optional field path was not found we should skip the patch.",
 			args: args{
 				req: &fnv1beta1.RunFunctionRequest{
 					Input: resource.MustStructObject(&v1beta1.Resources{
 						Resources: []v1beta1.ComposedTemplate{
 							{
-								// This template base no base, so we try to
-								// patch the resource named "cool-resource" in
-								// the desired resources array.
 								Name: "cool-resource",
+								Base: &runtime.RawExtension{Raw: []byte(`{"apiVersion":"example.org/v1","kind":"CD","spec":{}}`)},
+								Patches: []v1beta1.ComposedPatch{
+									{
+										// This patch should work.
+										Type: v1beta1.PatchTypeFromCompositeFieldPath,
+										Patch: v1beta1.Patch{
+											FromFieldPath: ptr.To[string]("spec.widgets"),
+											ToFieldPath:   ptr.To[string]("spec.watchers"),
+										},
+									},
+									{
+										// This patch should be skipped, because
+										// the path is not found
+										Type: v1beta1.PatchTypeFromCompositeFieldPath,
+										Patch: v1beta1.Patch{
+											FromFieldPath: ptr.To[string]("spec.doesNotExist"),
+										},
+									},
+								},
+							},
+						},
+					}),
+					Observed: &fnv1beta1.State{
+						Composite: &fnv1beta1.Resource{
+							Resource: resource.MustStructJSON(`{"apiVersion":"example.org/v1","kind":"XR","spec":{"widgets":"10"}}`),
+						},
+					},
+				},
+			},
+			want: want{
+				rsp: &fnv1beta1.RunFunctionResponse{
+					Meta: &fnv1beta1.ResponseMeta{Ttl: durationpb.New(response.DefaultTTL)},
+					Desired: &fnv1beta1.State{
+						Composite: &fnv1beta1.Resource{
+							Resource: resource.MustStructJSON(`{"apiVersion":"example.org/v1","kind":"XR"}`),
+						},
+						Resources: map[string]*fnv1beta1.Resource{
+							"cool-resource": {
+								// Watchers becomes "10" because our first patch
+								// worked. We only skipped the second patch.
+								Resource: resource.MustStructJSON(`{"apiVersion":"example.org/v1","kind":"CD","spec":{"watchers":"10"}}`),
+							},
+						},
+					},
+					Context: &structpb.Struct{Fields: map[string]*structpb.Value{fncontext.KeyEnvironment: structpb.NewStructValue(nil)}},
+				},
+			},
+		},
+		"RequiredFieldPathNotFound": {
+			reason: "If we fail to patch a desired resource because a required field path was not found, and the resource doesn't exist, we should not add it to desired state (i.e. create it).",
+			args: args{
+				req: &fnv1beta1.RunFunctionRequest{
+					Input: resource.MustStructObject(&v1beta1.Resources{
+						Resources: []v1beta1.ComposedTemplate{
+							{
+								Name: "new-resource",
+								Base: &runtime.RawExtension{Raw: []byte(`{"apiVersion":"example.org/v1","kind":"CD","spec":{}}`)},
+								Patches: []v1beta1.ComposedPatch{
+									{
+										// This patch will fail because the path
+										// is not found.
+										Type: v1beta1.PatchTypeFromCompositeFieldPath,
+										Patch: v1beta1.Patch{
+											FromFieldPath: ptr.To[string]("spec.doesNotExist"),
+											Policy: &v1beta1.PatchPolicy{
+												FromFieldPath: ptr.To[v1beta1.FromFieldPathPolicy](v1beta1.FromFieldPathPolicyRequired),
+											},
+										},
+									},
+								},
+							},
+							{
+								Name: "existing-resource",
+								Base: &runtime.RawExtension{Raw: []byte(`{"apiVersion":"example.org/v1","kind":"CD","spec":{"targetObject": {"keep": "me"}}}`)},
+								Patches: []v1beta1.ComposedPatch{
+									{
+										// This patch should work.
+										Type: v1beta1.PatchTypeFromCompositeFieldPath,
+										Patch: v1beta1.Patch{
+											FromFieldPath: ptr.To[string]("spec.widgets"),
+											ToFieldPath:   ptr.To[string]("spec.watchers"),
+										},
+									},
+									{
+										// This patch should work too and properly handle mergeOptions.
+										Type: v1beta1.PatchTypeFromCompositeFieldPath,
+										Patch: v1beta1.Patch{
+											FromFieldPath: ptr.To[string]("spec.sourceObject"),
+											ToFieldPath:   ptr.To[string]("spec.targetObject"),
+											Policy: &v1beta1.PatchPolicy{
+												ToFieldPath: ptr.To(v1beta1.ToFieldPathPolicyMergeObject),
+											},
+										},
+									},
+									{
+										// This patch will fail because the path
+										// is not found.
+										Type: v1beta1.PatchTypeFromCompositeFieldPath,
+										Patch: v1beta1.Patch{
+											FromFieldPath: ptr.To[string]("spec.doesNotExist"),
+											Policy: &v1beta1.PatchPolicy{
+												FromFieldPath: ptr.To[v1beta1.FromFieldPathPolicy](v1beta1.FromFieldPathPolicyRequired),
+											},
+										},
+									},
+								},
+							},
+						},
+					}),
+					Observed: &fnv1beta1.State{
+						Composite: &fnv1beta1.Resource{
+							Resource: resource.MustStructJSON(`{"apiVersion":"example.org/v1","kind":"XR","spec":{"widgets":"10", "sourceObject": {"me": "too"}}}`),
+						},
+						Resources: map[string]*fnv1beta1.Resource{
+							// "existing-resource" exists.
+							"existing-resource": {},
+
+							// Note "new-resource" doesn't appear in the
+							// observed resources. It doesn't yet exist.
+						},
+					},
+					Desired: &fnv1beta1.State{
+						Composite: &fnv1beta1.Resource{
+							Resource: resource.MustStructJSON(`{"apiVersion":"example.org/v1","kind":"XR","spec":{"widgets":"10"}}`),
+						},
+					},
+				},
+			},
+			want: want{
+				rsp: &fnv1beta1.RunFunctionResponse{
+					Meta: &fnv1beta1.ResponseMeta{Ttl: durationpb.New(response.DefaultTTL)},
+					Desired: &fnv1beta1.State{
+						Composite: &fnv1beta1.Resource{
+							Resource: resource.MustStructJSON(`{"apiVersion":"example.org/v1","kind":"XR","spec":{"widgets":"10"}}`),
+						},
+						Resources: map[string]*fnv1beta1.Resource{
+							// Note that the first patch did work. We only
+							// skipped the patch from the required field path.
+							"existing-resource": {
+								Resource: resource.MustStructJSON(`{"apiVersion":"example.org/v1","kind":"CD","spec":{"watchers":"10", "targetObject": {"me": "too", "keep": "me"}}}`),
+							},
+
+							// Note "new-resource" doesn't appear here.
+						},
+					},
+					Context: &structpb.Struct{Fields: map[string]*structpb.Value{fncontext.KeyEnvironment: structpb.NewStructValue(nil)}},
+					Results: []*fnv1beta1.Result{
+						{
+							Severity: fnv1beta1.Severity_SEVERITY_WARNING,
+							Message:  `not adding new composed resource "new-resource" to desired state because "FromCompositeFieldPath" patch at index 0 has 'policy.fromFieldPath: Required': spec.doesNotExist: no such field`,
+						},
+						{
+							Severity: fnv1beta1.Severity_SEVERITY_WARNING,
+							Message:  `cannot render composed resource "existing-resource" "FromCompositeFieldPath" patch at index 2: ignoring 'policy.fromFieldPath: Required' because 'to' resource already exists: spec.doesNotExist: no such field`,
+						},
+					},
+				},
+			},
+		},
+		"PatchErrorIsFatal": {
+			reason: "If we fail to patch a desired resource we should return a fatal result.",
+			args: args{
+				req: &fnv1beta1.RunFunctionRequest{
+					Input: resource.MustStructObject(&v1beta1.Resources{
+						Resources: []v1beta1.ComposedTemplate{
+							{
+								Name: "cool-resource",
+								Base: &runtime.RawExtension{Raw: []byte(`{"apiVersion":"example.org/v1","kind":"CD","spec":{}}`)},
 								Patches: []v1beta1.ComposedPatch{
 									{
 										// This patch should work.
@@ -406,18 +571,10 @@ func TestRunFunction(t *testing.T) {
 									},
 									{
 										// This patch should return an error,
-										// because the required path does not
-										// exist.
+										// because the path is not an array.
 										Type: v1beta1.PatchTypeFromCompositeFieldPath,
 										Patch: v1beta1.Patch{
-											FromFieldPath: ptr.To[string]("spec.doesNotExist"),
-											ToFieldPath:   ptr.To[string]("spec.explode"),
-											Policy: &v1beta1.PatchPolicy{
-												FromFieldPath: func() *v1beta1.FromFieldPathPolicy {
-													r := v1beta1.FromFieldPathPolicyRequired
-													return &r
-												}(),
-											},
+											FromFieldPath: ptr.To[string]("spec.widgets[0]"),
 										},
 									},
 								},
@@ -433,11 +590,6 @@ func TestRunFunction(t *testing.T) {
 						Composite: &fnv1beta1.Resource{
 							Resource: resource.MustStructJSON(`{"apiVersion":"example.org/v1","kind":"XR","spec":{"widgets":"10"}}`),
 						},
-						Resources: map[string]*fnv1beta1.Resource{
-							"cool-resource": {
-								Resource: resource.MustStructJSON(`{"apiVersion":"example.org/v1","kind":"CD","spec":{"watchers":42}}`),
-							},
-						},
 					},
 				},
 			},
@@ -448,21 +600,13 @@ func TestRunFunction(t *testing.T) {
 						Composite: &fnv1beta1.Resource{
 							Resource: resource.MustStructJSON(`{"apiVersion":"example.org/v1","kind":"XR","spec":{"widgets":"10"}}`),
 						},
-						Resources: map[string]*fnv1beta1.Resource{
-							"cool-resource": {
-								// spec.watchers would be "10" if we didn't
-								// discard the patch that worked.
-								Resource: resource.MustStructJSON(`{"apiVersion":"example.org/v1","kind":"CD","spec":{"watchers":42}}`),
-							},
-						},
 					},
 					Results: []*fnv1beta1.Result{
 						{
-							Severity: fnv1beta1.Severity_SEVERITY_WARNING,
-							Message:  fmt.Sprintf("cannot render patches for composed resource %q: cannot apply the %q patch at index 1: spec.doesNotExist: no such field", "cool-resource", "FromCompositeFieldPath"),
+							Severity: fnv1beta1.Severity_SEVERITY_FATAL,
+							Message:  fmt.Sprintf("cannot render composed resource %q %q patch at index 1: spec.widgets: not an array", "cool-resource", "FromCompositeFieldPath"),
 						},
 					},
-					Context: &structpb.Struct{Fields: map[string]*structpb.Value{fncontext.KeyEnvironment: structpb.NewStructValue(nil)}},
 				},
 			},
 		},
@@ -658,9 +802,9 @@ func TestRunFunction(t *testing.T) {
 						Environment: &v1beta1.Environment{
 							Patches: []v1beta1.EnvironmentPatch{
 								{
-									Type: v1beta1.PatchTypeFromEnvironmentFieldPath,
+									Type: v1beta1.PatchTypeToCompositeFieldPath,
 									Patch: v1beta1.Patch{
-										FromFieldPath: ptr.To[string]("data.widgets"),
+										FromFieldPath: ptr.To[string]("widgets"),
 										ToFieldPath:   ptr.To[string]("spec.watchers"),
 										Transforms: []v1beta1.Transform{
 											{
@@ -713,10 +857,10 @@ func TestRunFunction(t *testing.T) {
 						Environment: &v1beta1.Environment{
 							Patches: []v1beta1.EnvironmentPatch{
 								{
-									Type: v1beta1.PatchTypeToEnvironmentFieldPath,
+									Type: v1beta1.PatchTypeFromCompositeFieldPath,
 									Patch: v1beta1.Patch{
 										FromFieldPath: ptr.To[string]("spec.watchers"),
-										ToFieldPath:   ptr.To[string]("data.widgets"),
+										ToFieldPath:   ptr.To[string]("widgets"),
 										Transforms: []v1beta1.Transform{
 											{
 												Type: v1beta1.TransformTypeMath,
@@ -764,7 +908,7 @@ func TestRunFunction(t *testing.T) {
 							Patches: []v1beta1.ComposedPatch{{
 								Type: v1beta1.PatchTypeFromEnvironmentFieldPath,
 								Patch: v1beta1.Patch{
-									FromFieldPath: ptr.To[string]("data.widgets"),
+									FromFieldPath: ptr.To[string]("widgets"),
 									ToFieldPath:   ptr.To[string]("spec.watchers"),
 									Transforms: []v1beta1.Transform{{
 										Type: v1beta1.TransformTypeConvert,
@@ -816,7 +960,7 @@ func TestRunFunction(t *testing.T) {
 							Patches: []v1beta1.ComposedPatch{{
 								Type: v1beta1.PatchTypeFromEnvironmentFieldPath,
 								Patch: v1beta1.Patch{
-									FromFieldPath: ptr.To[string]("data.widgets"),
+									FromFieldPath: ptr.To[string]("widgets"),
 									ToFieldPath:   ptr.To[string]("spec.watchers"),
 									Transforms: []v1beta1.Transform{{
 										Type: v1beta1.TransformTypeConvert,
@@ -872,7 +1016,7 @@ func TestRunFunction(t *testing.T) {
 							Patches: []v1beta1.ComposedPatch{{
 								Type: v1beta1.PatchTypeFromEnvironmentFieldPath,
 								Patch: v1beta1.Patch{
-									FromFieldPath: ptr.To[string]("data.widgets"),
+									FromFieldPath: ptr.To[string]("widgets"),
 									ToFieldPath:   ptr.To[string]("spec.watchers"),
 									Transforms: []v1beta1.Transform{{
 										Type: v1beta1.TransformTypeConvert,
@@ -937,18 +1081,16 @@ func TestRunFunction(t *testing.T) {
 }
 
 // Crossplane sends as context a fake resource:
-// { "apiVersion": "internal.crossplane.io/v1alpha1", "kind": "Environment", "data": {... the actual environment content ...} }
+// { "apiVersion": "internal.crossplane.io/v1alpha1", "kind": "Environment", ... the actual environment content ... }
 // See: https://github.com/crossplane/crossplane/blob/806f0d20d146f6f4f1735c5ec6a7dc78923814b3/internal/controller/apiextensions/composite/environment_fetcher.go#L85C1-L85C1
 // That's because the patching code expects a resource to be able to use
 // runtime.DefaultUnstructuredConverter.FromUnstructured to convert it back to
-// an object. This is also why all patches need to specify the full path from data.
+// an object.
 func contextWithEnvironment(data map[string]interface{}) *structpb.Struct {
 	if data == nil {
 		data = map[string]interface{}{}
 	}
-	u := unstructured.Unstructured{Object: map[string]interface{}{
-		"data": data,
-	}}
+	u := unstructured.Unstructured{Object: data}
 	u.SetGroupVersionKind(schema.GroupVersionKind{Group: "internal.crossplane.io", Version: "v1alpha1", Kind: "Environment"})
 	d, err := structpb.NewStruct(u.UnstructuredContent())
 	if err != nil {

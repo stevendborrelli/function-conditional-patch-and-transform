@@ -5,24 +5,28 @@ import (
 	"strings"
 
 	"github.com/pkg/errors"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/utils/ptr"
 
+	xpv1 "github.com/crossplane/crossplane-runtime/apis/common/v1"
 	"github.com/crossplane/crossplane-runtime/pkg/fieldpath"
-	"github.com/crossplane/crossplane-runtime/pkg/resource"
 
-	"github.com/stevendborrelli/function-conditional-patch-and-transform/input/v1beta1"
+	"github.com/crossplane/function-sdk-go/resource/composed"
+	"github.com/crossplane/function-sdk-go/resource/composite"
+
+	"github.com/upboundcare/function-conditional-patch-and-transform/input/v1beta1"
 )
 
 const (
-	errPatchSetType             = "a patch in a PatchSet cannot be of type PatchSet"
-	errCombineRequiresVariables = "combine patch types require at least one variable"
+	errPatchSetType = "a patch in a PatchSet cannot be of type PatchSet"
 
 	errFmtUndefinedPatchSet           = "cannot find PatchSet by name %s"
-	errFmtInvalidPatchType            = "patch type %s is unsupported"
 	errFmtCombineStrategyNotSupported = "combine strategy %s is not supported"
 	errFmtCombineConfigMissing        = "given combine strategy %s requires configuration"
 	errFmtCombineStrategyFailed       = "%s strategy could not combine"
 	errFmtExpandingArrayFieldPaths    = "cannot expand ToFieldPath %s"
+	errFmtInvalidPatchPolicy          = "invalid patch policy %s"
 )
 
 // A PatchInterface is a patch that can be applied between resources.
@@ -41,50 +45,6 @@ type PatchWithPatchSetName interface {
 	GetPatchSetName() string
 }
 
-// Apply executes a patching operation between the from and to resources.
-// Applies all patch types unless an 'only' filter is supplied.
-func Apply(p PatchInterface, xr resource.Composite, cd resource.Composed, only ...v1beta1.PatchType) error {
-	return ApplyToObjects(p, xr, cd, only...)
-}
-
-// ApplyToObjects works like Apply but accepts any kind of runtime.Object. It
-// might be vulnerable to conversion panics (see
-// https://github.com/crossplane/crossplane/pull/3394 for details).
-func ApplyToObjects(p PatchInterface, a, b runtime.Object, only ...v1beta1.PatchType) error {
-	if filterPatch(p, only...) {
-		return nil
-	}
-
-	switch p.GetType() {
-	case v1beta1.PatchTypeFromCompositeFieldPath, v1beta1.PatchTypeFromEnvironmentFieldPath:
-		return ApplyFromFieldPathPatch(p, a, b)
-	case v1beta1.PatchTypeToCompositeFieldPath, v1beta1.PatchTypeToEnvironmentFieldPath:
-		return ApplyFromFieldPathPatch(p, b, a)
-	case v1beta1.PatchTypeCombineFromComposite, v1beta1.PatchTypeCombineFromEnvironment:
-		return ApplyCombineFromVariablesPatch(p, a, b)
-	case v1beta1.PatchTypeCombineToComposite, v1beta1.PatchTypeCombineToEnvironment:
-		return ApplyCombineFromVariablesPatch(p, b, a)
-	case v1beta1.PatchTypePatchSet:
-		// Already resolved - nothing to do.
-	}
-	return errors.Errorf(errFmtInvalidPatchType, p.GetType())
-}
-
-// filterPatch returns true if patch should be filtered (not applied)
-func filterPatch(p PatchInterface, only ...v1beta1.PatchType) bool {
-	// filter does not apply if not set
-	if len(only) == 0 {
-		return false
-	}
-
-	for _, patchType := range only {
-		if patchType == p.GetType() {
-			return false
-		}
-	}
-	return true
-}
-
 // ResolveTransforms applies a list of transforms to a patch value.
 func ResolveTransforms(ts []v1beta1.Transform, input any) (any, error) {
 	var err error
@@ -101,19 +61,12 @@ func ResolveTransforms(ts []v1beta1.Transform, input any) (any, error) {
 // on the "from" resource. Values may be transformed if any are defined on
 // the patch.
 func ApplyFromFieldPathPatch(p PatchInterface, from, to runtime.Object) error {
-	if p.GetFromFieldPath() == "" {
-		return errors.Errorf(errFmtRequiredField, "FromFieldPath", p.GetType())
-	}
-
 	fromMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(from)
 	if err != nil {
 		return err
 	}
 
 	in, err := fieldpath.Pave(fromMap).GetValue(p.GetFromFieldPath())
-	if IsOptionalFieldPathNotFound(err, p.GetPolicy()) {
-		return nil
-	}
 	if err != nil {
 		return err
 	}
@@ -129,43 +82,55 @@ func ApplyFromFieldPathPatch(p PatchInterface, from, to runtime.Object) error {
 		return patchFieldValueToMultiple(p.GetToFieldPath(), out, to)
 	}
 
-	return errors.Wrap(patchFieldValueToObject(p.GetToFieldPath(), out, to), "cannot patch to object")
+	mo, err := toMergeOption(p)
+	if err != nil {
+		return err
+	}
+
+	return errors.Wrap(patchFieldValueToObject(p.GetToFieldPath(), out, to, mo), "cannot patch to object")
+}
+
+// toMergeOption returns the MergeOptions from the PatchPolicy's ToFieldPathPolicy, if defined.
+func toMergeOption(p PatchInterface) (mo *xpv1.MergeOptions, err error) {
+	if p == nil {
+		return nil, nil
+	}
+	pp := p.GetPolicy()
+	if pp == nil {
+		return nil, nil
+	}
+	switch pp.GetToFieldPathPolicy() {
+	case v1beta1.ToFieldPathPolicyReplace:
+		// nothing to do, this is the default
+	case v1beta1.ToFieldPathPolicyAppendArray:
+		mo = &xpv1.MergeOptions{AppendSlice: ptr.To(true)}
+	case v1beta1.ToFieldPathPolicyMergeObject:
+		mo = &xpv1.MergeOptions{KeepMapValues: ptr.To(true)}
+	default:
+		// should never happen
+		return nil, errors.Errorf(errFmtInvalidPatchPolicy, pp.GetToFieldPathPolicy())
+	}
+	return mo, nil
 }
 
 // ApplyCombineFromVariablesPatch patches the "to" resource, taking a list of
-// input variables and combining them into a single output value.
-// The single output value may then be further transformed if they are defined
-// on the patch.
+// input variables and combining them into a single output value. The single
+// output value may then be further transformed if they are defined on the
+// patch.
 func ApplyCombineFromVariablesPatch(p PatchInterface, from, to runtime.Object) error {
-	// Combine patch requires configuration
-	if p.GetCombine() == nil {
-		return errors.Errorf(errFmtRequiredField, "Combine", p.GetType())
-	}
-	// Destination field path is required since we can't default to multiple
-	// fields.
-	if p.GetToFieldPath() == "" {
-		return errors.Errorf(errFmtRequiredField, "ToFieldPath", p.GetType())
-	}
-
-	combine := p.GetCombine()
-	vl := len(combine.Variables)
-
-	if vl < 1 {
-		return errors.New(errCombineRequiresVariables)
-	}
-
 	fromMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(from)
 	if err != nil {
 		return err
 	}
 
-	in := make([]any, vl)
+	c := p.GetCombine()
+	in := make([]any, len(c.Variables))
 
 	// Get value of each variable
 	// NOTE: This currently assumes all variables define a 'fromFieldPath'
 	// value. If we add new variable types, this may not be the case and
 	// this code may be better served split out into a dedicated function.
-	for i, sp := range combine.Variables {
+	for i, sp := range c.Variables {
 		iv, err := fieldpath.Pave(fromMap).GetValue(sp.FromFieldPath)
 
 		// If any source field is not found, we will not
@@ -174,9 +139,6 @@ func ApplyCombineFromVariablesPatch(p PatchInterface, from, to runtime.Object) e
 		// number of inputs (e.g. a string format
 		// expecting 3 fields '%s-%s-%s' but only
 		// receiving 2 values).
-		if IsOptionalFieldPathNotFound(err, p.GetPolicy()) {
-			return nil
-		}
 		if err != nil {
 			return err
 		}
@@ -184,7 +146,7 @@ func ApplyCombineFromVariablesPatch(p PatchInterface, from, to runtime.Object) e
 	}
 
 	// Combine input values
-	cb, err := Combine(*p.GetCombine(), in)
+	cb, err := Combine(*c, in)
 	if err != nil {
 		return err
 	}
@@ -195,23 +157,111 @@ func ApplyCombineFromVariablesPatch(p PatchInterface, from, to runtime.Object) e
 		return err
 	}
 
-	return errors.Wrap(patchFieldValueToObject(p.GetToFieldPath(), out, to), "cannot patch to object")
+	return errors.Wrap(patchFieldValueToObject(p.GetToFieldPath(), out, to, nil), "cannot patch to object")
 }
 
-// IsOptionalFieldPathNotFound returns true if the supplied error indicates a
-// field path was not found, and the supplied policy indicates a patch from that
-// field path was optional.
-func IsOptionalFieldPathNotFound(err error, p *v1beta1.PatchPolicy) bool {
-	switch {
-	case p == nil:
-		fallthrough
-	case p.FromFieldPath == nil:
-		fallthrough
-	case *p.FromFieldPath == v1beta1.FromFieldPathPolicyOptional:
-		return fieldpath.IsNotFound(err)
-	default:
+// ApplyEnvironmentPatch applies a patch to or from the environment. Patches to
+// the environment are always from the observed XR. Patches from the environment
+// are always to the desired XR.
+func ApplyEnvironmentPatch(p *v1beta1.EnvironmentPatch, env *unstructured.Unstructured, oxr, dxr *composite.Unstructured) error {
+	switch p.GetType() {
+	// From observed XR to environment.
+	case v1beta1.PatchTypeFromCompositeFieldPath:
+		return ApplyFromFieldPathPatch(p, oxr, env)
+	case v1beta1.PatchTypeCombineFromComposite:
+		return ApplyCombineFromVariablesPatch(p, oxr, env)
+
+	// From environment to desired XR.
+	case v1beta1.PatchTypeToCompositeFieldPath:
+		return ApplyFromFieldPathPatch(p, env, dxr)
+	case v1beta1.PatchTypeCombineToComposite:
+		return ApplyCombineFromVariablesPatch(p, env, dxr)
+
+	// Invalid patch types in this context.
+	case v1beta1.PatchTypeFromEnvironmentFieldPath,
+		v1beta1.PatchTypeCombineFromEnvironment,
+		v1beta1.PatchTypeToEnvironmentFieldPath,
+		v1beta1.PatchTypeCombineToEnvironment:
+		// Nothing to do.
+
+	case v1beta1.PatchTypePatchSet:
+		// Already resolved - nothing to do.
+	}
+	return nil
+}
+
+// ApplyComposedPatch applies a patch to or from a composed resource. Patches
+// from an observed composed resource can be to the desired XR, or to the
+// environment. Patches to a desired composed resource can be from the observed
+// XR, or from the environment.
+func ApplyComposedPatch(p *v1beta1.ComposedPatch, ocd, dcd *composed.Unstructured, oxr, dxr *composite.Unstructured, env *unstructured.Unstructured) error { //nolint:gocyclo // Just a long switch.
+	// Don't return an error if we're patching from a composed resource that
+	// doesn't exist yet. We'll try patch from it once it's been created.
+	if ocd == nil && !ToComposedResource(p) {
+		return nil
+	}
+
+	// We always patch from observed state to desired state. This is because
+	// folks will often want to patch from status fields, which only appear in
+	// observed state. Observed state should also eventually be consistent with
+	// desired state.
+	switch t := p.GetType(); t {
+
+	// From observed composed resource to desired XR.
+	case v1beta1.PatchTypeToCompositeFieldPath:
+		return ApplyFromFieldPathPatch(p, ocd, dxr)
+	case v1beta1.PatchTypeCombineToComposite:
+		return ApplyCombineFromVariablesPatch(p, ocd, dxr)
+
+	// From observed composed resource to environment.
+	case v1beta1.PatchTypeToEnvironmentFieldPath:
+		return ApplyFromFieldPathPatch(p, ocd, env)
+	case v1beta1.PatchTypeCombineToEnvironment:
+		return ApplyCombineFromVariablesPatch(p, ocd, env)
+
+	// From observed XR to desired composed resource.
+	case v1beta1.PatchTypeFromCompositeFieldPath:
+		return ApplyFromFieldPathPatch(p, oxr, dcd)
+	case v1beta1.PatchTypeCombineFromComposite:
+		return ApplyCombineFromVariablesPatch(p, oxr, dcd)
+
+	// From environment to desired composed resource.
+	case v1beta1.PatchTypeFromEnvironmentFieldPath:
+		return ApplyFromFieldPathPatch(p, env, dcd)
+	case v1beta1.PatchTypeCombineFromEnvironment:
+		return ApplyCombineFromVariablesPatch(p, env, dcd)
+
+	case v1beta1.PatchTypePatchSet:
+		// Already resolved - nothing to do.
+	}
+
+	return nil
+}
+
+// ToComposedResource returns true if the supplied patch is to a composed
+// resource, not from it.
+func ToComposedResource(p *v1beta1.ComposedPatch) bool {
+	switch p.GetType() {
+
+	// From observed XR to desired composed resource.
+	case v1beta1.PatchTypeFromCompositeFieldPath, v1beta1.PatchTypeCombineFromComposite:
+		return true
+	// From environment to desired composed resource.
+	case v1beta1.PatchTypeFromEnvironmentFieldPath, v1beta1.PatchTypeCombineFromEnvironment:
+		return true
+
+	// From composed resource to composite.
+	case v1beta1.PatchTypeToCompositeFieldPath, v1beta1.PatchTypeCombineToComposite:
+		return false
+	// From composed resource to environment.
+	case v1beta1.PatchTypeToEnvironmentFieldPath, v1beta1.PatchTypeCombineToEnvironment:
+		return false
+	// We can ignore patchsets; they're inlined.
+	case v1beta1.PatchTypePatchSet:
 		return false
 	}
+
+	return false
 }
 
 // Combine calls the appropriate combiner.
@@ -246,7 +296,7 @@ func ComposedTemplates(pss []v1beta1.PatchSet, cts []v1beta1.ComposedTemplate) (
 	pn := make(map[string][]v1beta1.ComposedPatch)
 	for _, s := range pss {
 		for _, p := range s.Patches {
-			if p.Type == v1beta1.PatchTypePatchSet {
+			if p.GetType() == v1beta1.PatchTypePatchSet {
 				return nil, errors.New(errPatchSetType)
 			}
 		}
@@ -257,12 +307,12 @@ func ComposedTemplates(pss []v1beta1.PatchSet, cts []v1beta1.ComposedTemplate) (
 	for i, r := range cts {
 		var po []v1beta1.ComposedPatch
 		for _, p := range r.Patches {
-			if p.Type != v1beta1.PatchTypePatchSet {
+			if p.GetType() != v1beta1.PatchTypePatchSet {
 				po = append(po, p)
 				continue
 			}
 			if p.PatchSetName == nil {
-				return nil, errors.Errorf(errFmtRequiredField, "PatchSetName", p.Type)
+				return nil, errors.Errorf(errFmtRequiredField, "PatchSetName", p.GetType())
 			}
 			ps, ok := pn[*p.PatchSetName]
 			if !ok {
@@ -278,13 +328,15 @@ func ComposedTemplates(pss []v1beta1.PatchSet, cts []v1beta1.ComposedTemplate) (
 
 // patchFieldValueToObject applies the value to the "to" object at the given
 // path, returning any errors as they occur.
-func patchFieldValueToObject(fieldPath string, value any, to runtime.Object) error {
+// If no merge options is supplied, then destination field is replaced
+// with the given value.
+func patchFieldValueToObject(fieldPath string, value any, to runtime.Object, mo *xpv1.MergeOptions) error {
 	paved, err := fieldpath.PaveObject(to)
 	if err != nil {
 		return err
 	}
 
-	if err := paved.SetValue(fieldPath, value); err != nil {
+	if err := paved.MergeValue(fieldPath, value, mo); err != nil {
 		return err
 	}
 
